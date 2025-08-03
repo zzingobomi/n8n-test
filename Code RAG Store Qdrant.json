@@ -1,0 +1,305 @@
+{
+  "name": "Code RAG Store Qdrant",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "5fe44bd5-e32c-47ce-83da-020fac2d5d72",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        48,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $json.owner }}/{{ $json.repo }}/git/trees/main?recursive=1",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "00b419be-7e07-4522-9ea9-b05be9b86a6f",
+      "name": "GitHub - Get Repo Tree",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        272,
+        176
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "oANwWioHNRhaJCdo",
+          "name": "GitHub account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// GitHub 레포지토리 정보 설정\nconst owner = 'zzingobomi';  // 여기에 GitHub 사용자명 입력\nconst repo = 'n8n-test';   // 여기에 레포지토리명 입력\n\nreturn { json: { owner, repo } };"
+      },
+      "id": "67cd8f88-e9e4-4160-93f8-f2dd4f59c244",
+      "name": "Config - Repo Info",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        48,
+        48
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "// TypeScript와 Python 파일만 필터링\nconst items = [];\n\nfor (const item of $input.all()) {\n  const files = item.json.tree || [];\n  \n  for (const file of files) {\n    if (file.type === 'blob') {\n      const path = file.path;\n      const ext = path.split('.').pop()?.toLowerCase();\n      \n      // Javascript, TypeScript, Python 파일만 포함\n      if (['js', 'jsx', 'ts', 'tsx', 'py'].includes(ext)) {\n        // 제외할 디렉토리들\n        const excludeDirs = ['node_modules', '__pycache__', 'dist', 'build', '.git'];\n        const shouldExclude = excludeDirs.some(dir => path.includes(dir));\n        \n        if (!shouldExclude) {\n          items.push({\n            json: {\n              path: path,\n              sha: file.sha,\n              size: file.size,\n              extension: ext\n            }\n          });\n        }\n      }\n    }\n  }\n}\n\nconsole.log(`Found ${items.length} code files`);\nreturn items;"
+      },
+      "id": "6f4399a0-d464-4a97-8650-6e03eaa538f0",
+      "name": "Filter Code Files",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        496,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 5,
+        "options": {}
+      },
+      "id": "ee673aa5-647d-4b95-9458-d4e71c0b3c8a",
+      "name": "Split In Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 1,
+      "position": [
+        720,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $('Config - Repo Info').first().json.owner }}/{{ $('Config - Repo Info').first().json.repo }}/contents/{{ $json.path }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "fc55dac7-f13c-4d2e-985b-122637295a3c",
+      "name": "GitHub - Get File Content",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        928,
+        176
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "oANwWioHNRhaJCdo",
+          "name": "GitHub account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// TypeScript, Python, JavaScript 코드 파싱 (RAG 최적화)\nconst items = [];\nconst owner = $('Config - Repo Info').first().json.owner;\nconst repo = $('Config - Repo Info').first().json.repo;\n\nfor (const item of $input.all()) {\n  const { path, content, encoding } = item.json;\n  \n  if (!content) continue;\n  \n  // Base64 디코딩\n  const decodedContent = encoding === 'base64' ? \n    Buffer.from(content, 'base64').toString('utf8') : content;\n  \n  const ext = path.split('.').pop()?.toLowerCase();\n  const fileName = path.split('/').pop();\n  const fileSize = Buffer.byteLength(decodedContent, 'utf8');\n  \n  // Import/Require 추출\n  const imports = extractImports(decodedContent, ext);\n  \n  let parsed = [];\n  \n  if (ext === 'ts' || ext === 'tsx') {\n    // TypeScript 파싱\n    const classRegex = /(?:export\\s+)?(?:abstract\\s+)?class\\s+(\\w+)(?:[^{]*)?\\s*{([\\s\\S]*?)^}/gm;\n    const functionRegex = /(?:export\\s+)?(?:async\\s+)?function\\s+(\\w+)\\s*\\([^)]*\\)(?:[^{]*)?\\s*{/g;\n    const interfaceRegex = /(?:export\\s+)?interface\\s+(\\w+)(?:[^{]*)?\\s*{([\\s\\S]*?)^}/gm;\n    const typeRegex = /(?:export\\s+)?type\\s+(\\w+)\\s*=/g;\n    \n    let match;\n    \n    // Classes\n    while ((match = classRegex.exec(decodedContent)) !== null) {\n      const fullMatch = match[0];\n      const className = match[1];\n      const startLine = decodedContent.substring(0, match.index).split('\\n').length;\n      const endLine = decodedContent.substring(0, match.index + fullMatch.length).split('\\n').length;\n      \n      // 클래스 내부의 메서드들 추출\n      const methods = extractMethods(fullMatch, 'typescript');\n      \n      parsed.push({\n        type: 'class',\n        name: className,\n        content: fullMatch,\n        path: path,\n        file_name: fileName,\n        file_extension: `.${ext}`,\n        language: 'typescript',\n        repository: `${owner}/${repo}`,\n        startLine: startLine,\n        endLine: endLine,\n        lines: `${startLine}-${endLine}`,\n        file_size: fileSize,\n        imports: imports,\n        methods: methods,\n        class_names: [className],\n        function_names: methods,\n        complexity: calculateComplexity(fullMatch),\n        created_at: new Date().toISOString()\n      });\n    }\n    \n    // Functions\n    while ((match = functionRegex.exec(decodedContent)) !== null) {\n      const functionName = match[1];\n      const startIndex = match.index;\n      const endIndex = findFunctionEnd(decodedContent, startIndex);\n      const functionContent = decodedContent.substring(startIndex, endIndex);\n      const startLine = decodedContent.substring(0, startIndex).split('\\n').length;\n      const endLine = decodedContent.substring(0, endIndex).split('\\n').length;\n      \n      parsed.push({\n        type: 'function',\n        name: functionName,\n        content: functionContent,\n        path: path,\n        file_name: fileName,\n        file_extension: `.${ext}`,\n        language: 'typescript',\n        repository: `${owner}/${repo}`,\n        startLine: startLine,\n        endLine: endLine,\n        lines: `${startLine}-${endLine}`,\n        file_size: fileSize,\n        imports: imports,\n        methods: [],\n        class_names: [],\n        function_names: [functionName],\n        complexity: calculateComplexity(functionContent),\n        created_at: new Date().toISOString()\n      });\n    }\n    \n    // Interfaces\n    while ((match = interfaceRegex.exec(decodedContent)) !== null) {\n      const interfaceName = match[1];\n      const fullMatch = match[0];\n      const startLine = decodedContent.substring(0, match.index).split('\\n').length;\n      const endLine = decodedContent.substring(0, match.index + fullMatch.length).split('\\n').length;\n      \n      parsed.push({\n        type: 'interface',\n        name: interfaceName,\n        content: fullMatch,\n        path: path,\n        file_name: fileName,\n        file_extension: `.${ext}`,\n        language: 'typescript',\n        repository: `${owner}/${repo}`,\n        startLine: startLine,\n        endLine: endLine,\n        lines: `${startLine}-${endLine}`,\n        file_size: fileSize,\n        imports: imports,\n        methods: [],\n        class_names: [],\n        function_names: [],\n        complexity: 1, // 인터페이스는 복잡도 낮음\n        created_at: new Date().toISOString()\n      });\n    }\n    \n    // Types\n    while ((match = typeRegex.exec(decodedContent)) !== null) {\n      const typeName = match[1];\n      const lineStart = decodedContent.lastIndexOf('\\n', match.index) + 1;\n      const lineEnd = decodedContent.indexOf('\\n', match.index);\n      const typeContent = decodedContent.substring(lineStart, lineEnd === -1 ? undefined : lineEnd);\n      const startLine = decodedContent.substring(0, match.index).split('\\n').length;\n      \n      parsed.push({\n        type: 'type',\n        name: typeName,\n        content: typeContent,\n        path: path,\n        file_name: fileName,\n        file_extension: `.${ext}`,\n        language: 'typescript',\n        repository: `${owner}/${repo}`,\n        startLine: startLine,\n        endLine: startLine,\n        lines: `${startLine}`,\n        file_size: fileSize,\n        imports: imports,\n        methods: [],\n        class_names: [],\n        function_names: [],\n        complexity: 1,\n        created_at: new Date().toISOString()\n      });\n    }\n  }\n  \n  else if (ext === 'js' || ext === 'jsx' || ext === 'mjs') {\n    // JavaScript 파싱\n    const classRegex = /(?:export\\s+)?(?:default\\s+)?class\\s+(\\w+)(?:\\s+extends\\s+\\w+)?\\s*{([\\s\\S]*?)^}/gm;\n    const functionRegex = /(?:export\\s+)?(?:async\\s+)?function\\s+(\\w+)\\s*\\([^)]*\\)\\s*{/g;\n    const arrowFunctionRegex = /(?:export\\s+)?(?:const|let|var)\\s+(\\w+)\\s*=\\s*(?:async\\s+)?\\([^)]*\\)\\s*=>/g;\n    \n    let match;\n    \n    // Classes\n    while ((match = classRegex.exec(decodedContent)) !== null) {\n      const fullMatch = match[0];\n      const className = match[1];\n      const startLine = decodedContent.substring(0, match.index).split('\\n').length;\n      const endLine = decodedContent.substring(0, match.index + fullMatch.length).split('\\n').length;\n      const methods = extractMethods(fullMatch, 'javascript');\n      \n      parsed.push({\n        type: 'class',\n        name: className,\n        content: fullMatch,\n        path: path,\n        file_name: fileName,\n        file_extension: `.${ext}`,\n        language: 'javascript',\n        repository: `${owner}/${repo}`,\n        startLine: startLine,\n        endLine: endLine,\n        lines: `${startLine}-${endLine}`,\n        file_size: fileSize,\n        imports: imports,\n        methods: methods,\n        class_names: [className],\n        function_names: methods,\n        complexity: calculateComplexity(fullMatch),\n        created_at: new Date().toISOString()\n      });\n    }\n    \n    // Functions\n    while ((match = functionRegex.exec(decodedContent)) !== null) {\n      const functionName = match[1];\n      const startIndex = match.index;\n      const endIndex = findFunctionEnd(decodedContent, startIndex);\n      const functionContent = decodedContent.substring(startIndex, endIndex);\n      const startLine = decodedContent.substring(0, startIndex).split('\\n').length;\n      const endLine = decodedContent.substring(0, endIndex).split('\\n').length;\n      \n      parsed.push({\n        type: 'function',\n        name: functionName,\n        content: functionContent,\n        path: path,\n        file_name: fileName,\n        file_extension: `.${ext}`,\n        language: 'javascript',\n        repository: `${owner}/${repo}`,\n        startLine: startLine,\n        endLine: endLine,\n        lines: `${startLine}-${endLine}`,\n        file_size: fileSize,\n        imports: imports,\n        methods: [],\n        class_names: [],\n        function_names: [functionName],\n        complexity: calculateComplexity(functionContent),\n        created_at: new Date().toISOString()\n      });\n    }\n    \n    // Arrow Functions\n    while ((match = arrowFunctionRegex.exec(decodedContent)) !== null) {\n      const functionName = match[1];\n      const startIndex = match.index;\n      let endIndex;\n      \n      const arrowIndex = decodedContent.indexOf('=>', startIndex);\n      if (arrowIndex !== -1) {\n        const nextChar = decodedContent[arrowIndex + 2].trim();\n        if (nextChar === '{') {\n          endIndex = findFunctionEnd(decodedContent, arrowIndex + 2);\n        } else {\n          const lineEnd = decodedContent.indexOf('\\n', arrowIndex);\n          const semicolonEnd = decodedContent.indexOf(';', arrowIndex);\n          endIndex = Math.min(\n            lineEnd === -1 ? decodedContent.length : lineEnd,\n            semicolonEnd === -1 ? decodedContent.length : semicolonEnd + 1\n          );\n        }\n      } else {\n        endIndex = decodedContent.length;\n      }\n      \n      const functionContent = decodedContent.substring(startIndex, endIndex);\n      const startLine = decodedContent.substring(0, startIndex).split('\\n').length;\n      const endLine = decodedContent.substring(0, endIndex).split('\\n').length;\n      \n      parsed.push({\n        type: 'arrow_function',\n        name: functionName,\n        content: functionContent,\n        path: path,\n        file_name: fileName,\n        file_extension: `.${ext}`,\n        language: 'javascript',\n        repository: `${owner}/${repo}`,\n        startLine: startLine,\n        endLine: endLine,\n        lines: `${startLine}-${endLine}`,\n        file_size: fileSize,\n        imports: imports,\n        methods: [],\n        class_names: [],\n        function_names: [functionName],\n        complexity: calculateComplexity(functionContent),\n        created_at: new Date().toISOString()\n      });\n    }\n  }\n  \n  else if (ext === 'py') {\n    // Python 파싱\n    const classRegex = /^class\\s+(\\w+)(?:\\([^)]*\\))?\\s*:([\\s\\S]*?)(?=^class|^def|^\\S|$)/gm;\n    const functionRegex = /^(?:\\s*)def\\s+(\\w+)\\s*\\([^)]*\\)(?:\\s*->\\s*[^:]+)?\\s*:([\\s\\S]*?)(?=^\\s*def|^class|^\\S|$)/gm;\n    \n    let match;\n    \n    // Classes\n    while ((match = classRegex.exec(decodedContent)) !== null) {\n      const className = match[1];\n      const fullMatch = match[0];\n      const startLine = decodedContent.substring(0, match.index).split('\\n').length;\n      const endLine = decodedContent.substring(0, match.index + fullMatch.length).split('\\n').length;\n      const methods = extractMethods(fullMatch, 'python');\n      \n      parsed.push({\n        type: 'class',\n        name: className,\n        content: fullMatch,\n        path: path,\n        file_name: fileName,\n        file_extension: `.${ext}`,\n        language: 'python',\n        repository: `${owner}/${repo}`,\n        startLine: startLine,\n        endLine: endLine,\n        lines: `${startLine}-${endLine}`,\n        file_size: fileSize,\n        imports: imports,\n        methods: methods,\n        class_names: [className],\n        function_names: methods,\n        complexity: calculateComplexity(fullMatch),\n        created_at: new Date().toISOString()\n      });\n    }\n    \n    // Functions\n    while ((match = functionRegex.exec(decodedContent)) !== null) {\n      const functionName = match[1];\n      const fullMatch = match[0];\n      const startLine = decodedContent.substring(0, match.index).split('\\n').length;\n      const endLine = decodedContent.substring(0, match.index + fullMatch.length).split('\\n').length;\n      \n      if (!functionName.startsWith('_')) {\n        parsed.push({\n          type: 'function',\n          name: functionName,\n          content: fullMatch,\n          path: path,\n          file_name: fileName,\n          file_extension: `.${ext}`,\n          language: 'python',\n          repository: `${owner}/${repo}`,\n          startLine: startLine,\n          endLine: endLine,\n          lines: `${startLine}-${endLine}`,\n          file_size: fileSize,\n          imports: imports,\n          methods: [],\n          class_names: [],\n          function_names: [functionName],\n          complexity: calculateComplexity(fullMatch),\n          created_at: new Date().toISOString()\n        });\n      }\n    }\n  }\n  \n  items.push(...parsed.map(p => ({ json: p })));\n}\n\n// Import 추출 함수\nfunction extractImports(content, ext) {\n  const imports = [];\n  \n  if (ext === 'ts' || ext === 'tsx' || ext === 'js' || ext === 'jsx' || ext === 'mjs') {\n    // ES6 imports\n    const importRegex = /import\\s+(?:{[^}]*}|[^{}\\s]+|\\*\\s+as\\s+\\w+)\\s+from\\s+['\"]([^'\"]+)['\"]/g;\n    const requireRegex = /require\\s*\\(\\s*['\"]([^'\"]+)['\"]\\s*\\)/g;\n    \n    let match;\n    while ((match = importRegex.exec(content)) !== null) {\n      imports.push(match[1]);\n    }\n    while ((match = requireRegex.exec(content)) !== null) {\n      imports.push(match[1]);\n    }\n  } else if (ext === 'py') {\n    // Python imports\n    const importRegex = /^(?:from\\s+(\\S+)\\s+)?import\\s+([^\\n]+)/gm;\n    \n    let match;\n    while ((match = importRegex.exec(content)) !== null) {\n      if (match[1]) {\n        imports.push(match[1]); // from module import\n      } else {\n        imports.push(match[2].split(',')[0].trim()); // import module\n      }\n    }\n  }\n  \n  return [...new Set(imports)]; // 중복 제거\n}\n\n// 메서드 추출 함수\nfunction extractMethods(classContent, language) {\n  const methods = [];\n  \n  if (language === 'typescript' || language === 'javascript') {\n    const methodRegex = /(?:async\\s+)?(\\w+)\\s*\\([^)]*\\)\\s*(?:{|=>)/g;\n    let match;\n    while ((match = methodRegex.exec(classContent)) !== null) {\n      const methodName = match[1];\n      if (methodName !== 'constructor' && !methodName.startsWith('_')) {\n        methods.push(methodName);\n      }\n    }\n  } else if (language === 'python') {\n    const methodRegex = /def\\s+(\\w+)\\s*\\(/g;\n    let match;\n    while ((match = methodRegex.exec(classContent)) !== null) {\n      const methodName = match[1];\n      if (!methodName.startsWith('_')) {\n        methods.push(methodName);\n      }\n    }\n  }\n  \n  return [...new Set(methods)];\n}\n\n// 복잡도 계산 함수 (간단한 버전)\nfunction calculateComplexity(code) {\n  // 제어문, 반복문, 조건문 개수로 간단하게 복잡도 측정\n  const complexityPatterns = [\n    /\\bif\\b/g,\n    /\\belse\\b/g,\n    /\\bfor\\b/g,\n    /\\bwhile\\b/g,\n    /\\bswitch\\b/g,\n    /\\bcatch\\b/g,\n    /\\btry\\b/g,\n    /\\?\\s*[^:]+\\s*:/g, // 삼항 연산자\n  ];\n  \n  let complexity = 1; // 기본 복잡도\n  \n  for (const pattern of complexityPatterns) {\n    const matches = code.match(pattern);\n    if (matches) {\n      complexity += matches.length;\n    }\n  }\n  \n  return Math.min(complexity, 10); // 최대 10으로 제한\n}\n\n// 기존 함수 끝을 찾는 헬퍼 함수\nfunction findFunctionEnd(content, startIndex) {\n  let braceCount = 0;\n  let inString = false;\n  let stringChar = '';\n  let i = startIndex;\n  \n  while (i < content.length && content[i] !== '{') {\n    i++;\n  }\n  \n  if (i >= content.length) return content.length;\n  \n  braceCount = 1;\n  i++;\n  \n  while (i < content.length && braceCount > 0) {\n    const char = content[i];\n    const prevChar = i > 0 ? content[i-1] : '';\n    \n    if (!inString) {\n      if (char === '\"' || char === \"'\" || char === '`') {\n        inString = true;\n        stringChar = char;\n      } else if (char === '{') {\n        braceCount++;\n      } else if (char === '}') {\n        braceCount--;\n      }\n    } else {\n      if (stringChar === '`' && char === '{' && prevChar === '$') {\n        braceCount++;\n      } else if (stringChar === '`' && char === '}' && braceCount > 1) {\n        braceCount--;\n      } else if (char === stringChar && prevChar !== '\\\\') {\n        inString = false;\n        stringChar = '';\n      }\n    }\n    \n    i++;\n  }\n  \n  return i;\n}\n\nconsole.log(`Parsed ${items.length} code elements with enhanced metadata`);\nreturn items;"
+      },
+      "id": "f0dba537-3c3e-4718-8003-f0c67f7d8b8a",
+      "name": "Parse Code Elements",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1152,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/embeddings",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "llama3.2"
+            },
+            {
+              "name": "prompt",
+              "value": "=File: {{ $json.file_name }} ({{ $json.language }})\\nPath: {{ $json.path }}\\nType: {{ $json.type }} - {{ $json.name }}\\nLines: {{ $json.lines }}\\nImports: {{ $json.imports.join(', ') }}\\nMethods: {{ $json.methods.join(', ') }}\\nComplexity: {{ $json.complexity }}\\n\\nCode:\\n{{ $json.content }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "0e8936f9-d84d-4d53-a342-bf046d69fb32",
+      "name": "Ollama - Generate Embeddings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        1376,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "http://host.docker.internal:6333/collections/typescript-python-code/points",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {}
+      },
+      "id": "50881484-873b-4769-8ca9-248f4286f02d",
+      "name": "Qdrant - Store Vectors",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        1808,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Ollama 출력을 Qdrant points 형식으로 변환\nconst items = $input.all();\n\nconsole.log('첫 번째 아이템 구조:', JSON.stringify(items[0]?.json, null, 2));\n\nconst points = items.map((item, index) => {\n  const data = item.json;\n  \n  // 간단한 숫자 ID (더 효율적)\n  const safeId = Date.now() * 1000 + index; // 타임스탬프 + 인덱스로 고유성 보장\n  \n  // 임베딩 벡터 확인\n  const embedding = data.embedding || data.vector;\n  if (!embedding) {\n    console.log('임베딩이 없는 아이템:', data);\n    throw new Error(`임베딩 벡터가 없습니다: ${data.name}`);\n  }\n  \n  return {\n    id: safeId,\n    vector: embedding,\n    payload: {\n      // 필수 필드들 (안전하게 처리)\n      file_path: data.path || '',\n      file_name: data.file_name || '',\n      file_extension: data.file_extension || '',\n      language: data.language || '',\n      type: data.type || '',\n      name: data.name || '',\n      repository: data.repository || '',\n      lines: data.lines || '',\n      startLine: data.startLine || 0,\n      endLine: data.endLine || 0,\n      \n      // 배열 필드들 (안전하게 처리)\n      imports: Array.isArray(data.imports) ? data.imports : [],\n      methods: Array.isArray(data.methods) ? data.methods : [],\n      class_names: Array.isArray(data.class_names) ? data.class_names : [],\n      function_names: Array.isArray(data.function_names) ? data.function_names : [],\n      \n      // 숫자 필드들\n      complexity: data.complexity || 1,\n      file_size: data.file_size || 0,\n      \n      // 코드 스니펫 (안전하게 처리)\n      code_snippet: data.content ? \n        (typeof data.content === 'string' ? data.content.substring(0, 1000) : String(data.content).substring(0, 1000)) : \n        '',\n      \n      // 타임스탬프\n      created_at: data.created_at || new Date().toISOString()\n    }\n  };\n});\n\nconsole.log(`${points.length}개의 포인트 생성됨`);\nconsole.log('첫 번째 포인트 예시:', JSON.stringify(points[0], null, 2));\n\nreturn [{ json: { points } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1584,
+        176
+      ],
+      "id": "b2dc9d92-e1f0-439a-99d6-4274ee92ad2f",
+      "name": "Embedding to Qdrant points"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config - Repo Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config - Repo Info": {
+      "main": [
+        [
+          {
+            "node": "GitHub - Get Repo Tree",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub - Get Repo Tree": {
+      "main": [
+        [
+          {
+            "node": "Filter Code Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Code Files": {
+      "main": [
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split In Batches": {
+      "main": [
+        [
+          {
+            "node": "GitHub - Get File Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub - Get File Content": {
+      "main": [
+        [
+          {
+            "node": "Parse Code Elements",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Code Elements": {
+      "main": [
+        [
+          {
+            "node": "Ollama - Generate Embeddings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama - Generate Embeddings": {
+      "main": [
+        [
+          {
+            "node": "Embedding to Qdrant points",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embedding to Qdrant points": {
+      "main": [
+        [
+          {
+            "node": "Qdrant - Store Vectors",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "83ed596c-f97f-4323-8f05-de68d0a4f0d6",
+  "meta": {
+    "instanceId": "1ede36ae35047c10c79f4d4262a39af89afb8bb93d5d3171710cf8b27a501353"
+  },
+  "id": "AMEj6OpPORS4Mlhe",
+  "tags": [
+    {
+      "createdAt": "2025-07-30T12:56:56.229Z",
+      "updatedAt": "2025-07-30T12:56:56.229Z",
+      "id": "i6oYqFLeeQPa89DR",
+      "name": "RAG Code Analysis"
+    }
+  ]
+}
